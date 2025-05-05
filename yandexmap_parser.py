@@ -1,11 +1,9 @@
 import os
-import cv2
 import time
+import cv2
+import math
 import numpy as np
-import pandas as pd
 from PIL import Image
-from datetime import datetime
-import sqlalchemy
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -13,115 +11,107 @@ from selenium.webdriver.chrome.options import Options
 
 class YandexMapAccidentParser:
     def __init__(self):
-        self.info_dict = {'xy_coord': [], 'date': [], 'timestamp': [], 'coord_stamp': []}
-        self.session_dict = {'xy_coord': [], 'date': [], 'timestamp': [], 'coord_stamp': []}
-        self.region_dict = {
-            'Центр': (255, 255, 255), 'Юго-Запад': (0, 38, 255), 'Фили': (182, 255, 0),
-            'Строгино': (255, 106, 0), 'Тушино': (178, 0, 255), 'Ховрино': (0, 127, 127),
-            'Дмитровка': (38, 127, 0), 'Останкино': (128, 128, 128), 'Медведково': (0, 255, 255),
-            'Лефортово': (127, 0, 55), 'Измайлово': (127, 51, 0), 'Перово': (255, 216, 0),
-            'Вешняки': (178, 255, 193), 'Кузьминки': (124, 94, 124), 'Люблино': (0, 148, 255),
-            'Зябликово': (127, 0, 0), 'Каширка': (56, 54, 63), 'Сукино Болото': (0, 19, 127)
-        }
-        self.engine = sqlalchemy.create_engine('mysql+mysqlconnector://root:@localhost:3306/accidents')
-        self.img_color_dist = Image.open("region_dist_color.png")
-
         self.screenshot_dir = "screenshots"
         os.makedirs(self.screenshot_dir, exist_ok=True)
 
-        lats = np.linspace(55.60, 55.90, 5)
-        lons = np.linspace(37.40, 37.90, 5)
+        self.lat_start, self.lat_end = 55.60, 55.90
+        self.lon_start, self.lon_end = 37.40, 37.90
+        lat_step = 0.085
+        lon_step = 0.25
+
+        lats = np.arange(self.lat_start, self.lat_end, lat_step)
+        lons = np.arange(self.lon_start, self.lon_end, lon_step)
         self.tile_coords = [(round(lat, 5), round(lon, 5)) for lat in lats for lon in lons]
 
-    def get_region(self, xy_coord):
-        color = self.img_color_dist.getpixel((xy_coord[0], xy_coord[1]))[:3]
-        return next((region for region, rgb in self.region_dict.items() if rgb == color), 'За МКАД')
-
-    def send_to_db(self, df):
-        for col in df.columns:
-            df[col] = df[col].apply(lambda x: str(x) if isinstance(x, tuple) else x)
-        with self.engine.connect() as con:
-            df.to_sql('accidents', con, if_exists='append', index=False)
-
     def initialize_browser(self):
-        chromedriver = "chromedriver-win64/chromedriver.exe"
-        chrome_options = Options()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920,1080")
-        service = Service(executable_path=chromedriver)
-        return webdriver.Chrome(service=service, options=chrome_options)
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        service = Service("chromedriver-win64/chromedriver.exe")
+        return webdriver.Chrome(service=service, options=options)
+    
+    def move_map(self, driver, lat, lon):
+        try:
+            driver.execute_script(f"yandex_map.setCenter([{lon}, {lat}], 13);")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"[Ошибка JS-перемещения] {e}")
 
-    def capture_and_crop_screenshot(self, driver, lat, lon, tile_index):
-        zoom = 12
-        url = f"https://yandex.ru/maps/213/moscow/?l=trf%2Ctrfe&ll={lon}%2C{lat}&z={zoom}"
-        driver.get(url)
-        time.sleep(2)
+    def capture_screenshot(self, driver, index):
+        temp_path = os.path.join(self.screenshot_dir, f"tile_{index}.png")
+        crop_path = os.path.join(self.screenshot_dir, f"tile_crop_{index}.png")
 
-        screenshot_path = os.path.join(self.screenshot_dir, f"screenshot_tile_{tile_index}.png")
-        driver.get_screenshot_as_file(screenshot_path)
+        driver.get_screenshot_as_file(temp_path)
 
-        img = Image.open(screenshot_path)
-        cropped_path = os.path.join(self.screenshot_dir, f"screenshot_crop_{tile_index}.png")
-        cropped_img = img.crop((450, 50, 1200, 923))
-        cropped_img.save(cropped_path)
+        img = Image.open(temp_path)
+        cropped_img = img.crop((384, 0, 1898, 930))
+        cropped_img.save(crop_path)
         img.close()
+        os.remove(temp_path)
+        return crop_path
 
-    def match_template_and_parse(self, tile_index):
-        image = cv2.imread(os.path.join(self.screenshot_dir, f"screenshot_crop_{tile_index}.png"))
+    def detect_accident(self, image_path, tile_center, index):
+        lat_c, lon_c = tile_center
+        image = cv2.imread(image_path)
         template = cv2.imread("scr_temp.png")
         h, w = template.shape[:2]
-        method = cv2.TM_CCOEFF_NORMED
-        res = cv2.matchTemplate(image, template, method)
-        max_val, x_c, y_c = 1, -10000, -10000
+        res = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
         threshold = 0.8
 
-        while max_val > threshold:
+        while True:
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            new_xc, new_yc = (2 * max_loc[0] + w) / 2, (2 * max_loc[1] + h) / 2
-            if (x_c, y_c) == (new_xc, new_yc):
+            if max_val < threshold:
                 break
+
+            center_x = max_loc[0] + w // 2
+            center_y = max_loc[1] + h // 2
+
+            lat, lon = self.pixel_to_geo(center_x, center_y, lat_c, lon_c)
+
+            print(f"🚨 ДТП найдено на тайле {index}! https://yandex.ru/maps/213/moscow/probki/?ll={lon}%2C{lat}&z=17")
+
             res[max_loc[1]-h//2:max_loc[1]+h//2+1, max_loc[0]-w//2:max_loc[0]+w//2+1] = 0
-            image = cv2.rectangle(image, max_loc, (max_loc[0] + w + 1, max_loc[1] + h + 1), (255, 0, 0))
-            x_c, y_c = new_xc, new_yc
-            self.update_info((x_c, y_c))
 
-        output_path = os.path.join(self.screenshot_dir, f"output_{tile_index}.png")
-        cv2.imwrite(output_path, image)
+        os.remove(image_path)
 
-    def update_info(self, coord):
-        x_c, y_c = coord
-        timestamp = int(datetime.now().timestamp())
-        if coord not in self.info_dict['xy_coord']:
-            for d in (self.info_dict, self.session_dict):
-                d['xy_coord'].append(coord)
-                d['date'].append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                d['timestamp'].append(timestamp)
-                d['coord_stamp'].append((x_c, y_c, timestamp))
-        elif timestamp - next(z for x, y, z in self.info_dict['coord_stamp'] if x == x_c and y == y_c) > 5000:
-            for d in (self.info_dict, self.session_dict):
-                d['xy_coord'].append(coord)
-                d['date'].append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                d['timestamp'].append(timestamp)
-                d['coord_stamp'].append((x_c, y_c, timestamp))
+    def lat_per_pixel(self, lat_center_deg, zoom):
+        tile_size = 256
+        scale = 2 ** zoom
+        lat_center_rad = math.radians(lat_center_deg)
 
-    def process_session_data(self):
-        if self.session_dict['xy_coord']:
-            df = pd.DataFrame(self.session_dict)
-            df['region'] = df.apply(lambda x: self.get_region(x['xy_coord']), axis=1)
-            self.send_to_db(df)
-            self.session_dict = {'xy_coord': [], 'date': [], 'timestamp': [], 'coord_stamp': []}
+        merc_y = (0.5 - math.log(math.tan(math.pi / 4 + lat_center_rad / 2)) / (2 * math.pi)) * tile_size * scale
+        delta_y = 1
+
+        y_top = merc_y - delta_y
+        n = math.pi - 2 * math.pi * y_top / (tile_size * scale)
+        lat_top = math.degrees(math.atan(math.sinh(n)))
+
+        return lat_top - lat_center_deg
+
+    def pixel_to_geo(self, x, y, lat_center, lon_center, width=1514, height=930, zoom=13):
+        lon_center += (x - width / 2) * (360 / pow(2, zoom + 8))
+        lat_center += (height / 2 - y) * self.lat_per_pixel(lat_center, zoom)
+
+        return round(lat_center, 6), round(lon_center, 6)
 
     def run(self):
         driver = self.initialize_browser()
+        try:
+            print("Загрузка карты...")
+            driver.get(f"https://yandex.ru/maps/213/moscow/?l=trf%2Ctrfe&ll={self.lon_start}%2C{self.lat_start}&z=13")
+            time.sleep(3)
+            print("Карта загружена. Производится поиск...")
 
-        for i, (lat, lon) in enumerate(self.tile_coords):
-            self.capture_and_crop_screenshot(driver, lat, lon, i)
-            self.match_template_and_parse(i)
-            self.process_session_data()
-
-        driver.quit()
-        self.img_color_dist.close()
+            for i, (lat, lon) in enumerate(self.tile_coords):
+                self.move_map(driver, lat, lon)
+                img_path = self.capture_screenshot(driver, i)
+                if img_path:
+                    self.detect_accident(img_path, (lat, lon), i)
+                else:
+                    print(f"[Пропуск] Не удалось получить скриншот для тайла {i}")
+        finally:
+            driver.quit()
 
 
 if __name__ == "__main__":
