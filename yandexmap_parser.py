@@ -2,26 +2,38 @@ import os
 import time
 import cv2
 import math
+import json
 import numpy as np
 from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from notifier import TelegramNotifier
 
 
 class YandexMapAccidentParser:
-    def __init__(self):
-        self.screenshot_dir = "screenshots"
-        os.makedirs(self.screenshot_dir, exist_ok=True)
+    def __init__(self, running_flag=None):
+        self.is_running = running_flag or (lambda: True)
 
-        self.lat_start, self.lat_end = 55.60, 55.90
-        self.lon_start, self.lon_end = 37.40, 37.90
+        with open("settings.json", "r") as f:
+            settings = json.load(f)
+
+        self.interval = settings["interval"]
+        self.bot_token = settings["bot_token"]
+        self.lat_start = settings["lat_start"] 
+        self.lat_end = settings["lat_end"] 
+        self.lon_start = settings["lon_start"] 
+        self.lon_end = settings["lon_end"] 
         lat_step = 0.085
         lon_step = 0.25
 
         lats = np.arange(self.lat_start, self.lat_end, lat_step)
         lons = np.arange(self.lon_start, self.lon_end, lon_step)
         self.tile_coords = [(round(lat, 5), round(lon, 5)) for lat in lats for lon in lons]
+        self.notifier = TelegramNotifier(bot_token=self.bot_token)
+
+        self.screenshot_dir = "screenshots"
+        os.makedirs(self.screenshot_dir, exist_ok=True)
 
     def initialize_browser(self):
         options = Options()
@@ -69,7 +81,9 @@ class YandexMapAccidentParser:
 
             lat, lon = self.pixel_to_geo(center_x, center_y, lat_c, lon_c)
 
-            print(f"🚨 ДТП найдено на тайле {index}! https://yandex.ru/maps/213/moscow/probki/?ll={lon}%2C{lat}&z=17")
+            if self.notifier.should_send((lat, lon)):
+                self.notifier.send_alert(lat, lon)
+                self.notifier.mark_sent((lat, lon))
 
             res[max_loc[1]-h//2:max_loc[1]+h//2+1, max_loc[0]-w//2:max_loc[0]+w//2+1] = 0
 
@@ -90,7 +104,7 @@ class YandexMapAccidentParser:
         return lat_top - lat_center_deg
 
     def pixel_to_geo(self, x, y, lat_center, lon_center, width=1514, height=930, zoom=13):
-        lon_center += (x - width / 2) * (360 / pow(2, zoom + 8))
+        lon_center += (x - width / 2) * (360 / pow(2, zoom + 8)) - 0.003193
         lat_center += (height / 2 - y) * self.lat_per_pixel(lat_center, zoom)
 
         return round(lat_center, 6), round(lon_center, 6)
@@ -103,17 +117,14 @@ class YandexMapAccidentParser:
             time.sleep(3)
             print("Карта загружена. Производится поиск...")
 
-            for i, (lat, lon) in enumerate(self.tile_coords):
-                self.move_map(driver, lat, lon)
-                img_path = self.capture_screenshot(driver, i)
-                if img_path:
-                    self.detect_accident(img_path, (lat, lon), i)
-                else:
-                    print(f"[Пропуск] Не удалось получить скриншот для тайла {i}")
+            while self.is_running():
+                for i, (lat, lon) in enumerate(self.tile_coords):
+                    self.move_map(driver, lat, lon)
+                    img_path = self.capture_screenshot(driver, i)
+                    if img_path:
+                        self.detect_accident(img_path, (lat, lon), i)
+                    else:
+                        print(f"[Пропуск] Не удалось получить скриншот для тайла {i}")
+                time.sleep(self.interval)
         finally:
             driver.quit()
-
-
-if __name__ == "__main__":
-    parser = YandexMapAccidentParser()
-    parser.run()

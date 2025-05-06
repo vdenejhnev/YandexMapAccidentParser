@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Настройки ДТП-парсера</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+  </head>
+  <body>
+    <h2>Настройки ДТП-парсера</h2>
+    <div class="settings-container">
+      <div class="settings-column">
+        <form method="post">
+          <label>Широта от (lat_start):</label><br />
+          <input name="lat_start" value="{{ settings.lat_start }}" /><br />
+          <label>Широта до (lat_end):</label><br />
+          <input name="lat_end" value="{{ settings.lat_end }}" /><br />
+          <label>Долгота от (lon_start):</label><br />
+          <input name="lon_start" value="{{ settings.lon_start }}" /><br />
+          <label>Долгота до (lon_end):</label><br />
+          <input name="lon_end" value="{{ settings.lon_end }}" /><br />
+          <label>Интервал (сек):</label><br />
+          <input name="interval" value="{{ settings.interval }}" /><br />
+          <label>Telegram Bot Token:</label><br />
+          <input name="bot_token" value="{{ settings.bot_token }}" />
+          <br />
+          <br />
+          <button type="submit">💾 Сохранить настройки</button>
+        </form>
+      </div>
+      <div class="settings-column">
+        <h3>Управление ботом</h3>
+        <p>Статус бота: <strong>{{ status }}</strong></p>
+        <form action="{{ '/stop' if running else '/start' }}" method="get">
+          <button type="submit">
+            {{ '⏹ Остановить бота' if running else '▶ Запустить бота' }}
+          </button>
+        </form>
+      </div>
+    </div>
+  </body>
+</html>
